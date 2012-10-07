@@ -232,7 +232,7 @@ public class JDBCRiver extends AbstractRiverComponent implements River {
                     	long batches = 0L;
                     	do {
                     		rows = 0;
-                    		rows = index(connection, sql + "LIMIT " + batchsize + " OFFSET " + batches * batchsize, version, digest);
+                    		rows = index(connection, sql + " LIMIT " + batchsize + " OFFSET " + batches * batchsize, version, digest);
                     		batches += 1;
                     	} while (rows > 0);
                     }
