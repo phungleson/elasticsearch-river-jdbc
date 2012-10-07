@@ -71,6 +71,7 @@ public class JDBCRiver extends AbstractRiverComponent implements River {
     private final boolean versioning;
     private final String rounding;
     private final int scale;
+    private final int batchsize;
     private volatile Thread thread;
     private volatile boolean closed;
     private Date creationDate;
@@ -96,6 +97,7 @@ public class JDBCRiver extends AbstractRiverComponent implements River {
             versioning = XContentMapValues.nodeBooleanValue(jdbcSettings.get("versioning"), true);
             rounding = XContentMapValues.nodeStringValue(jdbcSettings.get("rounding"), null);
             scale = XContentMapValues.nodeIntegerValue(jdbcSettings.get("scale"), 0);
+            batchsize = XContentMapValues.nodeIntegerValue(jdbcSettings.get("batchsize"), 0);
         } else {
             poll = TimeValue.timeValueMinutes(60);
             url = null;
@@ -110,6 +112,7 @@ public class JDBCRiver extends AbstractRiverComponent implements River {
             versioning = true;
             rounding = null;
             scale = 0;
+            batchsize = 0;
         }
         if (settings.settings().containsKey("index")) {
             Map<String, Object> indexSettings = (Map<String, Object>) settings.settings().get("index");
@@ -168,7 +171,37 @@ public class JDBCRiver extends AbstractRiverComponent implements River {
     }
 
     private class JDBCConnector implements Runnable {
-
+    	private long index(Connection connection, String sql, Number version, String digest) throws Exception{
+    		long rows = 0L;
+    		PreparedStatement statement = service.prepareStatement(connection, sql);
+            service.bind(statement, params);
+            ResultSet results = service.execute(statement, fetchsize);
+            Merger merger = new Merger(operation, version.longValue());
+            while (service.nextRow(results, merger)) {
+                rows++;
+            }
+            merger.close();
+            service.close(results);
+            service.close(statement);
+            logger.info("got " + rows + " rows for version " + version.longValue() + ", digest = " + merger.getDigest());
+            // save state to _custom
+            XContentBuilder builder = jsonBuilder();
+            builder.startObject().startObject("jdbc");
+            if (creationDate != null) {
+                builder.field("created", creationDate);
+            }
+            builder.field("version", version.longValue());
+            builder.field("digest", merger.getDigest());
+            builder.endObject().endObject();
+            client.prepareBulk().add(indexRequest(riverIndexName).type(riverName.name()).id("_custom").source(builder)).execute().actionGet();
+            // house keeping if data has changed
+            if (digest != null && !merger.getDigest().equals(digest)) {
+                housekeeper(version.longValue());
+                // perform outstanding housekeeper bulk requests
+                operation.flush();
+            }
+            return rows;
+    	}
         @Override
         public void run() {
             while (true) {
@@ -192,37 +225,20 @@ public class JDBCRiver extends AbstractRiverComponent implements River {
                         }
                     }
                     Connection connection = service.getConnection(driver, url, user, password, true);
-                    PreparedStatement statement = service.prepareStatement(connection, sql);
-                    service.bind(statement, params);
-                    ResultSet results = service.execute(statement, fetchsize);
-                    Merger merger = new Merger(operation, version.longValue());
-                    long rows = 0L;
-                    while (service.nextRow(results, merger)) {
-                        rows++;
+                    if (batchsize == 0){
+                        index(connection, sql, version, digest);
+                    } else {
+                    	long rows = 0L;
+                    	long batches = 0L;
+                    	do {
+                    		rows = 0;
+                    		rows = index(connection, sql + "LIMIT " + batchsize + " OFFSET " + batches * batchsize, version, digest);
+                    		batches += 1;
+                    	} while (rows > 0);
                     }
-                    merger.close();
-                    service.close(results);
-                    service.close(statement);
                     service.close(connection);
-                    logger.info("got " + rows + " rows for version " + version.longValue() + ", digest = " + merger.getDigest());
                     // this flush is required before house keeping starts
                     operation.flush();
-                    // save state to _custom
-                    XContentBuilder builder = jsonBuilder();
-                    builder.startObject().startObject("jdbc");
-                    if (creationDate != null) {
-                        builder.field("created", creationDate);
-                    }
-                    builder.field("version", version.longValue());
-                    builder.field("digest", merger.getDigest());
-                    builder.endObject().endObject();
-                    client.prepareBulk().add(indexRequest(riverIndexName).type(riverName.name()).id("_custom").source(builder)).execute().actionGet();
-                    // house keeping if data has changed
-                    if (digest != null && !merger.getDigest().equals(digest)) {
-                        housekeeper(version.longValue());
-                        // perform outstanding housekeeper bulk requests
-                        operation.flush();
-                    }
                     delay("next run");
                 } catch (Exception e) {
                     logger.error(e.getMessage(), e, (Object) null);
